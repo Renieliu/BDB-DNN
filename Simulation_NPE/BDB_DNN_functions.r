@@ -1,0 +1,615 @@
+# Shared piecewise-exponential simulation helpers for DNN training/testing and MAP.
+make_entry_dist <- function(accrual_end) {
+  force(accrual_end)
+  function() stats::runif(1, min = 0, max = accrual_end)
+}
+
+sim_pwe_arm_counts <- function(
+    n, lam, cuts,
+    analysis_time = cuts[length(cuts)],
+    entry_dist = function() 0
+) {
+  K <- length(lam)
+  d <- numeric(K)
+  Y <- numeric(K)
+
+  stopifnot(length(cuts) == K + 1)
+  stopifnot(analysis_time >= cuts[length(cuts)])
+
+  for (i in seq_len(n)) {
+    entry_time <- entry_dist()
+    followup_limit <- max(0, analysis_time - entry_time)
+    t_event <- 0
+    event_occurred <- FALSE
+
+    for (k in seq_len(K)) {
+      wait_k <- rexp(1, rate = lam[k])
+      if (wait_k < cuts[k + 1] - cuts[k]) {
+        t_event <- cuts[k] + wait_k
+        event_occurred <- TRUE
+        break
+      }
+    }
+    if (!event_occurred) t_event <- cuts[K + 1]
+
+    t_obs <- min(t_event, followup_limit)
+    delta <- as.integer(event_occurred && t_event <= followup_limit)
+
+    for (k in seq_len(K)) {
+      left <- cuts[k]
+      right <- cuts[k + 1]
+      Y[k] <- Y[k] + max(0, min(t_obs, right) - left)
+      if (delta == 1 && t_event >= left && t_event < right) d[k] <- d[k] + 1
+    }
+  }
+
+  list(d = d, Y = Y)
+}
+
+sim_hist_pwe_counts <- function(
+    n.vec.hist, E, K, cuts, base_lam_mat,
+    tau = 0.4, r_endpt = 0.0,
+    analysis_time = cuts[length(cuts)], entry_dist = function() 0
+) {
+  Jhist <- length(n.vec.hist)
+  R <- diag(E)
+  if (E == 2) R[1, 2] <- R[2, 1] <- r_endpt else stop("This template currently assumes E = 2.")
+  L <- chol(R)
+  d_hist <- array(0L, dim = c(Jhist, E, K))
+  Y_hist <- array(0, dim = c(Jhist, E, K))
+
+  for (j in seq_len(Jhist)) {
+    # chol() returns the upper factor U (R = U'U), so use t(U) to get Cov(b) = tau^2 R.
+    b <- as.vector(t(L) %*% rnorm(E)) * tau
+    for (e in seq_len(E)) {
+      sim <- sim_pwe_arm_counts(
+        n = n.vec.hist[j], lam = base_lam_mat[e, ] * exp(b[e]), cuts = cuts,
+        analysis_time = analysis_time, entry_dist = entry_dist
+      )
+      d_hist[j, e, ] <- as.integer(sim$d)
+      Y_hist[j, e, ] <- sim$Y
+    }
+  }
+  list(d_hist = d_hist, Y_hist = Y_hist)
+}
+
+sim_current_twoarm_counts <- function(
+    n_ctrl, n_trt, E, K, cuts, base_lam_ctrl_mat, beta_mat,
+    analysis_time = cuts[length(cuts)], entry_dist = function() 0
+) {
+  stopifnot(all(dim(base_lam_ctrl_mat) == c(E, K)), all(dim(beta_mat) == c(E, K)))
+  d_ctrl <- matrix(0L, E, K); Y_ctrl <- matrix(0, E, K)
+  d_trt <- matrix(0L, E, K); Y_trt <- matrix(0, E, K)
+
+  for (e in seq_len(E)) {
+    sim_c <- sim_pwe_arm_counts(n_ctrl, base_lam_ctrl_mat[e, ], cuts, analysis_time, entry_dist)
+    sim_t <- sim_pwe_arm_counts(n_trt, base_lam_ctrl_mat[e, ] * exp(beta_mat[e, ]), cuts, analysis_time, entry_dist)
+    d_ctrl[e, ] <- as.integer(sim_c$d); Y_ctrl[e, ] <- sim_c$Y
+    d_trt[e, ] <- as.integer(sim_t$d); Y_trt[e, ] <- sim_t$Y
+  }
+  list(d_ctrl = d_ctrl, Y_ctrl = Y_ctrl, d_trt = d_trt, Y_trt = Y_trt)
+}
+
+
+
+## functions for deep historical borrowing for multiple endpoints
+##################################################################################################
+## function to get responders based on historical response rate
+sim.hist.data.func = function(sim.hist.rate.vec.in){
+  ## data vector with first 6 for the first endpoint, then 6 for the second endpoint
+  sim.hist.data.vec = sapply(1:(n.endpoint*n.hist), 
+                             function(x){rbinom(1, rep(n.vec.hist, n.endpoint)[x],
+                                                rep(sim.hist.rate.vec.in, each = n.hist)[x])})
+  
+  ## turn to a matrix, row as endpoints, column as studies
+  sim.hist.data.mat = matrix(sim.hist.data.vec, nrow = n.endpoint, 
+                             ncol = n.hist, byrow= TRUE)
+  
+  ## return the vector and matrix
+  new.list = list("vec" = sim.hist.data.vec,
+                  "mat" = sim.hist.data.mat)
+}
+
+## function for DNN fitting. The last layer activation function. Can also try sigmoid activation 
+## function because the posterior probs are between 0 and 1. However, sigmoid function is easily
+## to get saturated (small gradient) at boundary. 
+
+DNN.fit <- function(data.train.scale.in, data.train.label.in, 
+                    drop.rate.in, active.name.in, n.node.in, 
+                    n.layer.in, max.epoch.in, batch_size_in, validation.prop.in,
+                    n.endpoint.in,
+                    output_activation = "linear",
+                    loss_name = "mse") {
+  
+  library(keras3)
+  
+  x_train <- as.matrix(data.train.scale.in)
+  y_train <- as.matrix(data.train.label.in)
+  n_features <- ncol(x_train)
+  
+  inputs <- layer_input(shape = n_features)
+  x <- inputs
+  for (i in seq_len(n.layer.in)) {
+    x <- x |>
+      layer_dense(units = n.node.in, activation = active.name.in) |>
+      layer_dropout(rate = drop.rate.in)
+  }
+  outputs <- x |> layer_dense(units = n.endpoint.in, activation = output_activation)
+  
+  model <- keras_model(inputs = inputs, outputs = outputs) |>
+    compile(
+      optimizer = optimizer_rmsprop(),
+      loss = loss_name,
+      metrics = "mse"
+    )
+  
+  history <- model |>
+    fit(
+      x = x_train,
+      y = y_train,
+      epochs = max.epoch.in,
+      batch_size = batch_size_in,
+      validation_split = validation.prop.in,
+      verbose = 0
+    )
+  
+  list(model = model, history = history)
+}
+
+beta_bar_from_beta <- function(beta_mat, Y_c, Y_t) {
+  stopifnot(all(dim(beta_mat) == dim(Y_c)), all(dim(beta_mat) == dim(Y_t)))
+  E <- nrow(beta_mat)
+  out <- numeric(E)
+  for (e in seq_len(E)) {
+    weights <- Y_c[e, ] + Y_t[e, ]
+    if (sum(weights) <= 0) {
+      out[e] <- mean(beta_mat[e, ])
+    } else {
+      out[e] <- sum(weights * beta_mat[e, ]) / sum(weights)
+    }
+  }
+  out
+}
+
+npe_gaussian_nll <- function(n.endpoint.in) {
+  force(n.endpoint.in)
+  function(y_true, y_pred) {
+    library(tensorflow)
+    mu <- tf$slice(
+      y_pred,
+      begin = as.integer(c(0, 0)),
+      size = as.integer(c(-1, n.endpoint.in))
+    )
+    raw_log_sd <- tf$slice(
+      y_pred,
+      begin = as.integer(c(0, n.endpoint.in)),
+      size = as.integer(c(-1, n.endpoint.in))
+    )
+    log_sd <- tf$clip_by_value(raw_log_sd, -8, 4)
+    z <- (y_true - mu) / tf$exp(log_sd)
+    nll <- 0.5 * tf$square(z) + log_sd
+    tf$reduce_mean(tf$reduce_sum(nll, axis = 1L))
+  }
+}
+
+NPE.gaussian.fit <- function(data.train.scale.in, beta_bar.train.in,
+                             data.validation.scale.in = NULL,
+                             beta_bar.validation.in = NULL,
+                             drop.rate.in = 0.1,
+                             active.name.in = "relu",
+                             n.node.in = 120,
+                             n.layer.in = 3,
+                             max.epoch.in = 1000,
+                             batch_size_in = 100,
+                             n.endpoint.in,
+                             early.stop.patience.in = 50) {
+  # With a validation set, training stops once the validation NLL has not
+  # improved for early.stop.patience.in epochs and the best weights are kept.
+  # Without it, the Gaussian NPE overfits and its SDs become too small
+  # (under-coverage); set early.stop.patience.in = NULL to disable.
+  library(keras3)
+
+  x_train <- as.matrix(data.train.scale.in)
+  y_train <- as.matrix(beta_bar.train.in)
+  n_features <- ncol(x_train)
+  
+  inputs <- layer_input(shape = n_features)
+  x <- inputs
+  for (i in seq_len(n.layer.in)) {
+    x <- x |>
+      layer_dense(units = n.node.in, activation = active.name.in) |>
+      layer_dropout(rate = drop.rate.in)
+  }
+  outputs <- x |> layer_dense(units = 2 * n.endpoint.in, activation = "linear")
+  
+  model <- keras_model(inputs = inputs, outputs = outputs) |>
+    compile(
+      optimizer = optimizer_rmsprop(),
+      loss = npe_gaussian_nll(n.endpoint.in)
+    )
+  
+  if (!is.null(data.validation.scale.in) && !is.null(beta_bar.validation.in)) {
+    history <- model |>
+      fit(
+        x = x_train,
+        y = y_train,
+        epochs = max.epoch.in,
+        batch_size = batch_size_in,
+        validation_data = list(
+          as.matrix(data.validation.scale.in),
+          as.matrix(beta_bar.validation.in)
+        ),
+        callbacks = if (is.null(early.stop.patience.in)) NULL else list(
+          callback_early_stopping(monitor = "val_loss",
+                                  patience = early.stop.patience.in,
+                                  restore_best_weights = TRUE)
+        ),
+        verbose = 0
+      )
+  } else {
+    history <- model |>
+      fit(
+        x = x_train,
+        y = y_train,
+        epochs = max.epoch.in,
+        batch_size = batch_size_in,
+        verbose = 0
+      )
+  }
+  
+  list(model = model, history = history)
+}
+
+predict_npe_gaussian <- function(NPE.model.in, data.scale.in, n.endpoint.in) {
+  raw <- as.matrix(predict(NPE.model.in, as.matrix(data.scale.in)))
+  mu <- raw[, seq_len(n.endpoint.in), drop = FALSE]
+  log_sd <- raw[, n.endpoint.in + seq_len(n.endpoint.in), drop = FALSE]
+  log_sd <- pmin(pmax(log_sd, -8), 4)
+  sd <- exp(log_sd)
+  prob_lt0 <- pnorm(0, mean = mu, sd = sd)
+  list(mean = mu, sd = sd, prob_lt0 = prob_lt0)
+}
+
+## function to obtain the critical value
+critical.value.func.tte <- function(
+    n.itt.in,                # number of Monte Carlo iterations for cutoff
+    n.new.in,                # sample size per arm
+    E, K, cuts,              # TTE structure
+    loglam_mean_vec,         # length E: control mean log-hazard
+    beta_mat,                # E x K interval-specific beta matrix
+    shape_sd = 0.15,         # SD of log-hazard deviations across intervals
+    # first-stage prob DNN objects (weights + scaling)
+    col_means_train.in,
+    col_stddevs_train.in,
+    DNN.first.weight.in,
+    DNN.first.layer.in,
+    type.1.error.in,
+    analysis_time.in = cuts[length(cuts)],
+    entry_dist.in = function() 0
+) {
+  
+  p_hat_mat <- matrix(NA_real_, nrow = n.itt.in, ncol = E)
+  
+  for (itt in 1:n.itt.in) {
+    # progress print
+    if (itt %% 100 == 0) cat("itt=", itt, "\n")
+    
+    # generate hazards per endpoint
+    lam_c_list <- lapply(1:E, function(e) make_lam_profile(loglam_mean_vec[e], K, shape_sd))
+    lam_t_list <- lapply(1:E, function(e) lam_c_list[[e]] * exp(beta_mat[e, ]))
+    
+    # simulate aggregated counts/person-time
+    d_c <- matrix(0L, E, K); Y_c <- matrix(0, E, K)
+    d_t <- matrix(0L, E, K); Y_t <- matrix(0, E, K)
+    
+    for (e in 1:E) {
+      sc <- sim_pwe_arm_counts(
+        n.new.in, lam_c_list[[e]], cuts,
+        analysis_time = analysis_time.in,
+        entry_dist = entry_dist.in
+      )
+      st <- sim_pwe_arm_counts(
+        n.new.in, lam_t_list[[e]], cuts,
+        analysis_time = analysis_time.in,
+        entry_dist = entry_dist.in
+      )
+      
+      d_c[e, ] <- as.integer(sc$d); Y_c[e, ] <- sc$Y
+      d_t[e, ] <- as.integer(st$d); Y_t[e, ] <- st$Y
+    }
+    
+    # build first-stage feature vector (same order as the training data)
+    x <- t(as.matrix(c(as.numeric(d_c), as.numeric(Y_c), as.numeric(d_t), as.numeric(Y_t))))
+    # fast DNN forward (sigmoid output)
+    p_hat <- pred.DNN.sigmoid(
+      DNN.final.weights.in = DNN.first.weight.in,
+      n.layer.in = DNN.first.layer.in,
+      data.train.in = x,
+      col_means_train.in = col_means_train.in,
+      col_stddevs_train.in = col_stddevs_train.in
+    )
+    
+    p_hat_mat[itt, ] <- as.numeric(p_hat)[1:E]
+  }
+  
+  # determine cutoff depending on null pattern
+  beta_is_null <- rowSums(abs(beta_mat)) == 0
+  if (all(beta_is_null)) {
+    # Global null: Pr{(S1 > c12) OR (S2 > c12) | H12} <= alpha.
+    max_prob <- apply(p_hat_mat, 1, max)
+    cutoff <- sort(max_prob)[ceiling((1 - type.1.error.in) * (n.itt.in + 1))]
+  } else {
+    # single-null cases: use the null endpoint's (1-alpha) quantile
+    null_idx <- which(beta_is_null)
+    # with more than one null endpoint, use the first one
+    cutoff <- sort(p_hat_mat[, null_idx[1]])[ceiling((1 - type.1.error.in) * (n.itt.in + 1))]
+  }
+  
+  cutoff
+}
+
+## DNN fitting function for critical values to accommodate different input data dimension
+DNN.combine.fit <- function(DNN.second.mat.in, DNN.second.label.in,
+                            DNN.second.layer.in, DNN.second.node.in) {
+  
+  # Scale returns a matrix; keep as.matrix for keras
+  data.DNN.second.train.scale <- scale(as.matrix(DNN.second.mat.in))
+  
+  col_means_train_second <- attr(data.DNN.second.train.scale, "scaled:center")
+  col_stddevs_train_second <- attr(data.DNN.second.train.scale, "scaled:scale")
+  
+  DNN.second.temp <- DNN.fit(
+    data.train.scale.in  = data.DNN.second.train.scale,
+    data.train.label.in  = as.matrix(DNN.second.label.in),
+    drop.rate.in         = 0.1,
+    active.name.in       = "relu",
+    n.node.in            = DNN.second.node.in,
+    n.layer.in           = DNN.second.layer.in,
+    max.epoch.in         = 1000,
+    batch_size_in        = 100,
+    validation.prop.in   = 0,
+    n.endpoint.in        = 1,
+    output_activation    = "sigmoid",
+    loss_name            = "mse"
+  )
+  
+  list(
+    DNN.model   = DNN.second.temp,
+    mean_center = col_means_train_second,
+    sd_center   = col_stddevs_train_second
+  )
+}
+
+## get fitted values from DNN, which can be used in parallel computing
+pred.DNN.normal = function(DNN.final.weights.in, n.layer.in, data.train.in,
+                           col_means_train.in, col_stddevs_train.in){
+  
+  w1.scale = DNN.final.weights.in[[1]]
+  b1.scale = as.matrix(DNN.final.weights.in[[2]])
+  w1 = t(w1.scale/matrix(rep(col_stddevs_train.in, dim(w1.scale)[2]),
+                         nrow = dim(w1.scale)[1], ncol = dim(w1.scale)[2]))
+  b1 = b1.scale - t(w1.scale)%*%as.matrix(col_means_train.in/col_stddevs_train.in)
+  
+  for (wb.itt in 2:(n.layer.in+1)){
+    w.text = paste0("w", wb.itt, "=t(DNN.final.weights.in[[", wb.itt*2-1, "]])")
+    b.text = paste0("b", wb.itt, "= as.matrix(DNN.final.weights.in[[", wb.itt*2, "]])")
+    
+    eval(parse(text=w.text))
+    eval(parse(text=b.text))
+  }
+  
+  eval_f_whole_text1 = paste0(
+    "eval_f <- function( x ) {x.mat = as.matrix(as.numeric(x), nrow = length(x), ncol = 1);
+    w1x = (w1)%*%x.mat + b1;sw1x = as.matrix(c(relu(w1x)))")
+  
+  eval_f_whole_text2 = NULL
+  for (wb.itt in 2:(n.layer.in)){
+    wx.text = paste0("w", wb.itt, "x = (w", wb.itt, ")%*%sw", wb.itt-1,
+                     "x + b", wb.itt)
+    swx.text = paste0("sw", wb.itt, "x = as.matrix(c(relu(w", wb.itt, "x)))")
+    eval_f_whole_text2 = paste(eval_f_whole_text2, wx.text, swx.text, sep = ";")
+  }
+  
+  wb.itt.final = n.layer.in + 1
+  wx.text = paste0("w", wb.itt.final, "x = (w", wb.itt.final, ")%*%sw", wb.itt.final-1,
+                   "x + b", wb.itt.final)
+  swx.text = paste0("sw",n.layer.in+1,"x =(w", wb.itt.final, "x)")
+  eval_f_whole_text2 = paste(eval_f_whole_text2, wx.text, swx.text, sep = ";")
+  
+  eval_f_whole_text3 = paste0(";return(sw", n.layer.in+1, "x)}")
+  
+  eval_f_whole_text = paste(eval_f_whole_text1, eval_f_whole_text2,
+                            eval_f_whole_text3)
+  
+  eval(parse(text=eval_f_whole_text))
+  
+  final.pred = sapply(1:(dim(data.train.in)[1]),
+                      function(y){eval_f(x = as.vector(data.train.in[y,]))})
+  return(final.pred)
+}  
+
+## ReLU activation function
+relu = function(x){
+  return(pmax(0, x))
+}
+
+sigmoid <- function(x) 1/(1 + exp(-x))
+
+pred.DNN.sigmoid <- function(DNN.final.weights.in, n.layer.in, data.train.in,
+                             col_means_train.in, col_stddevs_train.in) {
+  lin <- pred.DNN.normal(
+    DNN.final.weights.in = DNN.final.weights.in,
+    n.layer.in = n.layer.in,
+    data.train.in = data.train.in,
+    col_means_train.in = col_means_train.in,
+    col_stddevs_train.in = col_stddevs_train.in
+  )
+  sigmoid(lin)
+}
+
+make_lam_profile <- function(loglam_mean, K, shape_sd = 0.15) {
+  # log hazards: random perturbations around the mean
+  eps <- rnorm(K, mean = 0, sd = shape_sd)
+  lam <- exp(loglam_mean + eps)
+  lam
+}
+
+make_beta_profile <- function(beta_mean, K, shape_sd = 0.15) {
+  if (beta_mean == 0) {
+    return(rep(0, K))
+  }
+
+  eps <- rnorm(K, mean = 0, sd = shape_sd)
+  beta_mean + eps - mean(eps)
+}
+
+draw_beta_profile <- function(K, beta.lower, beta.upper, jitter_sd = 0.05) {
+  pattern <- sample(c("constant", "delayed", "early", "heterogeneous"), size = 1)
+  
+  beta <- rep(0, K)
+  b <- runif(1, beta.lower, beta.upper)
+  
+  if (pattern == "constant") {
+    beta[] <- b
+  }
+  
+  if (pattern == "delayed") {
+    delay <- sample(1:(K - 1), size = 1)
+    active_len <- K - delay
+    active <- seq(log(0.9), b, length.out = active_len)
+    beta[(delay + 1):K] <- active
+  }
+  
+  if (pattern == "early") {
+    stop_at <- sample(1:(K - 1), size = 1)
+    active <- seq(b, log(0.9), length.out = stop_at)
+    beta[1:stop_at] <- active
+  }
+  
+  if (pattern == "heterogeneous") {
+    beta[] <- runif(K, beta.lower, beta.upper)
+  }
+  
+  active_idx <- beta != 0
+  beta[active_idx] <- beta[active_idx] + rnorm(sum(active_idx), 0, jitter_sd)
+  
+  beta
+}
+
+# History-conditioned NPE training data for the PWE model (multi_tte.stan).
+# 1. Fit npe_history_pwe.stan once to the fixed historical data, giving draws
+#    of (mu, tau, sigma_endpt, L_R) from p(. | D_H).
+# 2. For each simulated current trial, draw a NEW current-control study effect
+#    from the hierarchical model (as for study Jhist+1 in multi_tte.stan) and
+#    draw beta from the multi_tte.stan prior; then simulate the current trial.
+# The pairs (x, beta_bar) therefore come from p(beta_bar, D_C | D_H), so the
+# fitted NPE q(beta_bar | x) targets the same history-conditioned posterior as
+# the MCMC labels.  The historical data enter through this generating
+# distribution, not as (constant) input features.
+draw_lkj2_chol_E2 <- function(eta = 2) {
+  # LKJ(eta) for E = 2: (r + 1) / 2 ~ Beta(eta, eta); return the lower Cholesky factor.
+  r <- 2 * rbeta(1, eta, eta) - 1
+  t(chol(matrix(c(1, r, r, 1), 2, 2)))
+}
+
+make_npe_training_data_pwe <- function(d_hist, Y_hist, n_new, cuts, analysis_time,
+    entry_dist, n_train, n_valid, n_eval, stan_file, output_dir,
+    seed = 20261014L, chains = 4L, iter = 4000L, warmup = 2000L,
+    check_mcmc = TRUE) {
+  J <- dim(d_hist)[1]; E <- dim(d_hist)[2]; K <- dim(d_hist)[3]
+  stopifnot(identical(dim(d_hist), dim(Y_hist)), E == 2, length(cuts) == K + 1)
+
+  rstan::rstan_options(auto_write = TRUE)
+  sm <- rstan::stan_model(file = stan_file)
+  fit <- rstan::sampling(sm,
+    data = list(Jhist = J, E = E, K = K, d_hist = d_hist, Y_hist = Y_hist),
+    chains = chains, iter = iter, warmup = warmup, cores = 1, refresh = 0,
+    seed = seed, control = list(adapt_delta = 0.99, max_treedepth = 12))
+
+  ss <- rstan::summary(fit, pars = c("mu", "tau", "sigma_endpt", "L_R", "sigma_time"))$summary
+  sp <- rstan::get_sampler_params(fit, inc_warmup = FALSE)
+  diagnostics <- data.frame(
+    max_Rhat = max(ss[, "Rhat"], na.rm = TRUE),
+    min_ESS = min(ss[, "n_eff"], na.rm = TRUE),
+    divergences = sum(vapply(sp, function(x) sum(x[, "divergent__"]), numeric(1))),
+    treedepth_hits = sum(vapply(sp, function(x) sum(x[, "treedepth__"] >= 12), numeric(1))))
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  write.csv(diagnostics, file.path(output_dir, "NPE_history_MCMC_diagnostics.csv"), row.names = FALSE)
+  if (check_mcmc && (!is.finite(diagnostics$max_Rhat) || diagnostics$max_Rhat > 1.05 ||
+      diagnostics$min_ESS < 100 || diagnostics$divergences > 0 || diagnostics$treedepth_hits > 0))
+    stop("Historical posterior did not pass MCMC diagnostics. Increase iterations/review fit.")
+
+  post <- rstan::extract(fit, pars = c("mu", "tau", "sigma_endpt", "L_R"))
+  saveRDS(list(d_hist = d_hist, Y_hist = Y_hist, draws = post, diagnostics = diagnostics),
+          file.path(output_dir, "NPE_history_posterior.rds"))
+  n_draws <- dim(post$mu)[1]
+
+  generate <- function(n, rng_seed) {
+    set.seed(rng_seed)
+    xx <- matrix(NA_real_, n, 4 * E * K)
+    bb <- matrix(NA_real_, n, E)
+    for (i in seq_len(n)) {
+      s <- sample.int(n_draws, 1)
+      L_Sigma <- diag(post$sigma_endpt[s, ], E) %*% post$L_R[s, , ]
+      theta_c <- matrix(NA_real_, E, K)
+      for (k in seq_len(K)) {
+        theta_c[, k] <- post$mu[s, , k] + post$tau[s, k] * as.vector(L_Sigma %*% rnorm(E))
+      }
+
+      # beta prior of multi_tte.stan (multivariate random walk):
+      # beta[,1] ~ MVN(0, S), beta[,k] | beta[,k-1] ~ MVN(beta[,k-1], S),
+      # S = diag(sigma_beta) R_beta diag(sigma_beta), sigma_beta ~ HalfNormal(0, 0.5), R_beta ~ LKJ(2)
+      sigma_beta <- abs(rnorm(E, 0, 0.5))
+      L_beta <- diag(sigma_beta, E) %*% draw_lkj2_chol_E2(2)
+      beta <- matrix(NA_real_, E, K)
+      beta[, 1] <- as.vector(L_beta %*% rnorm(E))
+      for (k in seq_len(K)[-1]) beta[, k] <- beta[, k - 1] + as.vector(L_beta %*% rnorm(E))
+
+      lam_c <- exp(theta_c)
+      lam_t <- exp(theta_c + beta)
+      s_c1 <- sim_pwe_arm_counts(n_new, lam_c[1, ], cuts, analysis_time, entry_dist)
+      s_c2 <- sim_pwe_arm_counts(n_new, lam_c[2, ], cuts, analysis_time, entry_dist)
+      s_t1 <- sim_pwe_arm_counts(n_new, lam_t[1, ], cuts, analysis_time, entry_dist)
+      s_t2 <- sim_pwe_arm_counts(n_new, lam_t[2, ], cuts, analysis_time, entry_dist)
+      d_c <- rbind(s_c1$d, s_c2$d); Y_c <- rbind(s_c1$Y, s_c2$Y)
+      d_t <- rbind(s_t1$d, s_t2$d); Y_t <- rbind(s_t1$Y, s_t2$Y)
+
+      # same feature ordering as flatten_features() in BDB_DNN_train.r
+      xx[i, ] <- c(as.numeric(d_c), as.numeric(Y_c), as.numeric(d_t), as.numeric(Y_t))
+      bb[i, ] <- beta_bar_from_beta(beta, Y_c, Y_t)
+    }
+    stopifnot(all(is.finite(xx)), all(is.finite(bb)))
+    list(x = xx, beta_bar = bb)
+  }
+
+  list(train = generate(n_train, seed + 1L),
+       validation = generate(n_valid, seed + 2L),
+       evaluation = generate(n_eval, seed + 3L),
+       diagnostics = diagnostics)
+}
+
+# Fit multi_tte.stan with adapt_delta = 0.99 and retry with new seeds/inits if
+# sampling fails (e.g. initialization failure for extreme counts).  Returns the
+# beta_bar draws and the number of divergent transitions; stops if every
+# attempt fails so that no dataset is silently given a missing label.
+fit_multi_tte_robust <- function(sm, stan_data, seed, chains = 2, iter = 2000,
+                                 warmup = 1000, adapt_delta = 0.99,
+                                 max_tries = 3) {
+  for (attempt in seq_len(max_tries)) {
+    fit <- tryCatch(
+      rstan::sampling(sm, data = stan_data, chains = chains, iter = iter,
+                      warmup = warmup, refresh = 0, cores = 1,
+                      seed = seed + 100000L * (attempt - 1L),
+                      init_r = c(2, 1, 0.5)[min(attempt, 3)],
+                      control = list(adapt_delta = adapt_delta)),
+      error = function(e) NULL)
+    if (!is.null(fit) && length(fit@sim) > 0 && fit@mode == 0) {
+      sp <- rstan::get_sampler_params(fit, inc_warmup = FALSE)
+      return(list(
+        beta_bar = rstan::extract(fit, pars = "beta_bar")$beta_bar,
+        divergences = sum(vapply(sp, function(x) sum(x[, "divergent__"]), numeric(1))),
+        attempts = attempt))
+    }
+  }
+  stop("multi_tte.stan failed for seed ", seed, " after ", max_tries, " attempts.")
+}
